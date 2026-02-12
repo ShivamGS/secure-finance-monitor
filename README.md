@@ -2,41 +2,54 @@
 
 Security-first AI agent for monitoring personal finances via Gmail with zero PII exposure to LLMs.
 
+> **See [Sample Outputs](docs/sample_outputs/)** for real-world examples of scan, chat, summary, and injection detection.
+
 ## Architecture
 
 ```
                         SECURE PERSONAL FINANCE MONITOR
- ┌─────────────────────────────────────────────────────────────────────┐
- │                                                                     │
- │  ┌───────────────┐    ┌──────────────────────┐    ┌──────────────┐ │
- │  │  GMAIL API    │    │   SECURITY WALL      │    │  AI AGENT    │ │
- │  │  (MCP Server) │───>│                      │───>│  (OpenAI     │ │
- │  │               │    │  Pass 1: Regex (10   │    │   Agents SDK)│ │
- │  │  - Read-only  │    │          patterns)   │    │              │ │
- │  │  - OAuth2     │    │  Pass 2: Presidio    │    │  - Categorize│ │
- │  │  - Financial  │    │          NER         │    │  - Anomalies │ │
- │  │    senders    │    │  Pass 3: Validator   │    │  - Summaries │ │
- │  │               │    │          sweep       │    │  - Injection │ │
- │  └───────────────┘    │                      │    │    detection │ │
- │                       │  FAIL CLOSED:        │    │              │ │
- │                       │  Error = no content  │    │  Output also │ │
- │                       │  passes through      │    │  sanitized   │ │
- │                       └──────────────────────┘    └──────┬───────┘ │
- │                                                          │         │
- │  ┌───────────────────────────────────────────────────────┘         │
- │  │                                                                 │
- │  v                                                                 │
- │  ┌──────────────────────┐    ┌────────────────────────────────┐   │
- │  │  ENCRYPTED STORAGE   │    │  AUDIT LOG                     │   │
- │  │  (SQLCipher)         │    │                                │   │
- │  │                      │    │  - Hash-chained entries        │   │
- │  │  - Transactions      │    │  - Tamper detection            │   │
- │  │  - Subscriptions     │    │  - Dual write: DB + JSONL      │   │
- │  │  - Anomalies         │    │  - Every action logged         │   │
- │  │  - Metadata ONLY     │    │  - CRITICAL events             │   │
- │  │  - No raw content    │    │                                │   │
- │  └──────────────────────┘    └────────────────────────────────┘   │
- └─────────────────────────────────────────────────────────────────────┘
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │                                                                             │
+ │  ┌───────────────┐    ┌───────────────┐    ┌─────────────────────────────┐ │
+ │  │  GMAIL API    │    │  BLOCKLIST    │    │   PII REDACTION WALL        │ │
+ │  │  (MCP Server) │───>│   (Layer 2)   │───>│   (Layer 3)                 │ │
+ │  │               │    │               │    │                             │ │
+ │  │  - Read-only  │    │  - Spam       │    │  Pass 1: Regex (10 patterns)│ │
+ │  │  - OAuth2     │    │  - Promo      │    │  Pass 2: Presidio NER       │ │
+ │  │  - Financial  │    │  - Marketing  │    │  Pass 3: Validator sweep    │ │
+ │  │    senders    │    │  - Sender     │    │                             │ │
+ │  │               │    │    filter     │    │  FAIL CLOSED:               │ │
+ │  └───────────────┘    │               │    │  Error = no content         │ │
+ │                       └───────────────┘    │  passes through             │ │
+ │                                            └─────────────┬───────────────┘ │
+ │                                                          │                 │
+ │                                                          v                 │
+ │                                            ┌──────────────────────────────┐ │
+ │                                            │  AI AGENT (Layer 4)          │ │
+ │                                            │  (OpenAI Agents SDK)         │ │
+ │                                            │                              │ │
+ │                                            │  - Transaction extraction    │ │
+ │                                            │  - Categorization            │ │
+ │                                            │  - Anomaly detection         │ │
+ │                                            │  - Injection detection       │ │
+ │                                            │  - Output sanitized          │ │
+ │                                            └──────────────┬───────────────┘ │
+ │                                                           │                 │
+ │  ┌────────────────────────────────────────────────────────┘                 │
+ │  │                                                                          │
+ │  v                                                                          │
+ │  ┌──────────────────────┐    ┌────────────────────────────────────────┐    │
+ │  │  ENCRYPTED STORAGE   │    │  AUDIT LOG (Layer 6)                   │    │
+ │  │  (Layer 5)           │    │                                        │    │
+ │  │  (SQLCipher)         │    │  - Hash-chained entries                │    │
+ │  │                      │    │  - Tamper detection                    │    │
+ │  │  - Transactions      │    │  - Dual write: DB + JSONL              │    │
+ │  │  - Subscriptions     │    │  - Every action logged                 │    │
+ │  │  - Anomalies         │    │  - CRITICAL events                     │    │
+ │  │  - Metadata ONLY     │    │                                        │    │
+ │  │  - No raw content    │    │                                        │    │
+ │  └──────────────────────┘    └────────────────────────────────────────┘    │
+ └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Data Flow:** Gmail API → Blocklist → PII Redactor (3-pass, no LLM) → Sanitized Data → AI Agent → Encrypted DB + Audit Log
@@ -125,8 +138,6 @@ python -m src.main test-gmail
 # Reset database (clear all data)
 python -m src.main reset --confirm
 ```
-
-> See [Sample Outputs](docs/sample_outputs/) for example results from each command.
 
 ## Chat Mode
 
@@ -244,7 +255,3 @@ See `.env.example` for complete list.
 - **LLM Providers:** OpenAI (`openai`) or Anthropic (`anthropic`)
 - **Console Display:** Rich library
 - **Testing:** pytest (183 tests)
-
-## License
-
-MIT
