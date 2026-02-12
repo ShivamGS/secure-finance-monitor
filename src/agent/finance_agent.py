@@ -242,18 +242,47 @@ class FinanceAgent:
                             logger.info(f"🔧 Tool call {i+1}: {tool_call.name}")
 
                             # Parse tool results to extract pipeline stats
-                            if tool_call.name in ["scan_financial_emails", "generate_summary"] and hasattr(step, 'tool_results'):
-                                for result in step.tool_results:
+                            if tool_call.name in ["scan_financial_emails", "generate_summary"]:
+                                # Check multiple possible result locations in OpenAI Agents SDK format
+                                tool_result_output = None
+
+                                # Method 1: Check step.tool_results
+                                if hasattr(step, 'tool_results') and step.tool_results:
+                                    tool_result_output = step.tool_results[0].output if len(step.tool_results) > 0 else None
+
+                                # Method 2: Check tool_call.result (alternative SDK format)
+                                elif hasattr(tool_call, 'result'):
+                                    tool_result_output = tool_call.result
+
+                                # Method 3: Check step.output (another possible location)
+                                elif hasattr(step, 'output'):
+                                    tool_result_output = step.output
+
+                                if tool_result_output:
                                     try:
-                                        result_data = json.loads(result.output) if isinstance(result.output, str) else result.output
-                                        # scan_financial_emails returns these fields directly
-                                        metadata["fetched"] = result_data.get("total_emails", 0) or metadata["fetched"]
-                                        metadata["blocked"] = result_data.get("blocked_count", 0) or metadata["blocked"]
-                                        metadata["stored"] = result_data.get("transactions_found", 0) or result_data.get("total_transactions", 0) or metadata["stored"]
-                                        metadata["redacted"] = result_data.get("total_redactions", 0) or metadata["redacted"]
-                                        # Redaction count would need to be passed through
-                                    except:
-                                        pass
+                                        # Parse JSON result
+                                        if isinstance(tool_result_output, str):
+                                            result_data = json.loads(tool_result_output)
+                                        elif isinstance(tool_result_output, dict):
+                                            result_data = tool_result_output
+                                        else:
+                                            continue
+
+                                        # Extract metadata from result
+                                        if result_data.get("total_emails") is not None:
+                                            metadata["fetched"] = result_data["total_emails"]
+                                        if result_data.get("blocked_count") is not None:
+                                            metadata["blocked"] = result_data["blocked_count"]
+                                        if result_data.get("transactions_found") is not None:
+                                            metadata["stored"] = result_data["transactions_found"]
+                                        if result_data.get("total_transactions") is not None:
+                                            metadata["stored"] = result_data["total_transactions"]
+                                        if result_data.get("total_redactions") is not None:
+                                            metadata["redacted"] = result_data["total_redactions"]
+
+                                        logger.debug(f"📊 Metadata extracted: {metadata}")
+                                    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+                                        logger.warning(f"Failed to parse tool result metadata: {e}")
 
             raw_response = run_result.final_output or ""
             logger.info("✅ Agent response generated (%d chars)", len(raw_response))

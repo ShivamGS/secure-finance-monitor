@@ -79,6 +79,40 @@ python -m src.main demo
 python -m src.main demo-injection
 ```
 
+### Chat Mode Capabilities
+
+The interactive chat mode (`python -m src.main chat`) supports natural language queries about your finances:
+
+**Transaction Queries:**
+- `last 30 days transactions` - View all transactions from the past 30 days
+- `what did I buy this week` - See recent purchases from the last 7 days
+- `show me my spending in February` - View spending for a specific period
+- `my recent purchases` - Display recent transaction history
+
+**Spending Analysis:**
+- `give me a spending summary` - Get categorized breakdown of your expenses
+- `how much did I spend on groceries` - Category-specific spending analysis
+- `what's my biggest expense category` - Identify top spending categories
+- `show me my subscriptions` - Find recurring charges
+
+**Merchant & Pattern Analysis:**
+- `which merchants did I pay the most` - Top merchants by total spending
+- `how many times did I shop at Walmart` - Transaction count by merchant
+- `show duplicate charges` - Detect potential duplicate transactions
+- `find unusual spending` - Identify anomalies and spikes
+
+**Security & Anomalies:**
+- `any suspicious transactions` - Check for potential fraud or anomalies
+- `show me large transactions` - Filter high-value transactions
+- `new merchants this month` - First-time transactions from new vendors
+
+**Features:**
+- 🔒 **Zero PII Exposure** - All data redacted before reaching the AI agent
+- 📊 **Real-time Pipeline Stats** - See Fetched/Blocked/Redacted counts for each query
+- 🛡️ **Prompt Injection Detection** - Automatically flags security threats
+- 💬 **Natural Language** - No need to learn commands, just ask naturally
+- 🔄 **Fresh Data** - Every query fetches latest emails from Gmail
+
 ### Tests
 ```bash
 python -m pytest tests/ -v  # All tests

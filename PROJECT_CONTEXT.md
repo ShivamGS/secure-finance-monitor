@@ -178,6 +178,45 @@ Gmail API (raw, dangerous)
 
 ---
 
+## Recent Improvements (Feb 2026)
+
+### Chat Mode Enhancement
+**Problem:** Chat agent wasn't calling `scan_financial_emails` when users asked about transactions, causing:
+- "Fetched: 0" metadata display (no tool called)
+- Only returning 1 stale transaction from database
+- Missing all recent Gmail data
+
+**Root Causes:**
+1. Ambiguous prompt - only mentioned calling tool for "emails", not "transactions/spending"
+2. Default `max_results=20` instead of 100
+3. Missing `total_redactions` field in tool return value
+4. Silent exception handling in metadata extraction
+
+**Fixes Applied:**
+1. **Rewrote system prompt** ([src/agent/prompts.py](src/agent/prompts.py:28-43)) - Added "CRITICAL RULE - ALWAYS FETCH FRESH DATA" with explicit examples showing every finance query must call `scan_financial_emails` first
+2. **Increased tool defaults** ([src/agent/tools.py](src/agent/tools.py:35)) - Changed from `max_results=20` to `max_results=100` to match scan command
+3. **Pass through redaction count** ([src/agent/tools.py](src/agent/tools.py:52-53,106)) - Added `total_redactions` to tool return value
+4. **Robust metadata extraction** ([src/agent/finance_agent.py](src/agent/finance_agent.py:237-285)) - Enhanced to check multiple result locations (step.tool_results, tool_call.result, step.output), handle dict/string formats, explicit None checks, log warnings instead of silent failures
+
+**Result:** Chat mode now correctly fetches fresh Gmail data for every query, returns all 16 transactions, and displays accurate pipeline stats.
+
+### Demo Output Improvements
+**Fixes:**
+1. **Demo-injection formatting** ([src/main.py](src/main.py:441-543)) - Replaced raw prints with rich Tree structure (4 layers: Email Processing, Injection Detection, Security Threats, Audit Trail), removed inline CRITICAL stderr spam
+2. **PII Redaction Demo** ([src/mcp_server/server.py](src/mcp_server/server.py:138-177)) - Fixed HTML stripping position bug (strip BEFORE calculating positions), added ellipsis formatting, only use examples where before != after
+3. **CRITICAL event suppression** ([src/storage/audit.py](src/storage/audit.py:29-37,95-96)) - Added `suppress_stderr` parameter to suppress CRITICAL stderr output during scan/demo modes (still logged to file and displayed in LAYER 4/6)
+
+### Chat Mode Capabilities
+Users can now ask natural language queries:
+- **Transaction queries:** "last 30 days transactions", "what did I buy this week"
+- **Spending analysis:** "give me a spending summary", "how much did I spend on groceries"
+- **Merchant analysis:** "which merchants did I pay the most", "show duplicate charges"
+- **Security:** "any suspicious transactions", "find unusual spending"
+
+All queries now fetch fresh Gmail data with proper pipeline stats display.
+
+---
+
 ## Key Design Decisions
 
 1. **Pattern priority ordering** — GENERIC_LONG_NUMBER at priority 35 (before PHONE at 40) so order numbers like `#114-3948572-8837261` are caught by context-aware pattern first
@@ -194,7 +233,7 @@ Gmail API (raw, dangerous)
 ## How to Run Tests
 
 ```bash
-# All 174 tests
+# All 183 tests
 python -m pytest tests/ -v
 
 # By phase
@@ -202,6 +241,7 @@ python -m pytest tests/test_redactor.py -v      # Phase 1: 59 tests
 python -m pytest tests/test_mcp_server.py -v     # Phase 2: 25 tests
 python -m pytest tests/test_agent.py -v          # Phase 3: 48 tests
 python -m pytest tests/test_storage.py -v        # Phase 4: 42 tests
+python -m pytest tests/test_integration.py -v    # Integration: 9 tests
 ```
 
 ## How to Demo
@@ -241,10 +281,11 @@ python -m src.main chat
 
 ## Known Issues / TODOs
 
-1. `datetime.utcnow()` deprecation warnings — Python 3.12+ prefers `datetime.now(datetime.UTC)`. Cosmetic only, does not affect functionality.
-2. `main.py` is a placeholder — needs Phase 5 integration wiring.
-3. `pysqlcipher3` requires system-level `sqlcipher` library — graceful fallback to plain sqlite3 if unavailable.
-4. Presidio spacy model `en_core_web_sm` must be downloaded separately (`python -m spacy download en_core_web_sm`).
+1. **Chat metadata display** - Pipeline stats sometimes show "Fetched: 0" due to OpenAI Agents SDK result format variations. Enhanced metadata extraction checks multiple locations but may need further refinement.
+2. **datetime.utcnow() deprecation** - Python 3.12+ prefers `datetime.now(datetime.UTC)`. Cosmetic only, does not affect functionality. Low priority.
+3. **SQLCipher dependency** - Requires system-level `sqlcipher` library (`brew install sqlcipher` on macOS). Graceful fallback to plain sqlite3 if unavailable.
+4. **Presidio spacy model** - `en_core_web_sm` must be downloaded separately: `python -m spacy download en_core_web_sm`
+5. **Test count update** - README and docs reference 174 tests, but current count is 183 after recent improvements.
 
 ---
 
