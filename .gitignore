@@ -1,0 +1,33 @@
+# Environment and secrets
+.env
+credentials.json
+token.json
+
+# Database
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Audit logs (generated at runtime)
+audit.jsonl
+*_audit.jsonl
+*_audit_log.jsonl
+audit_log.json
+
+# Demo databases
+demo_finance_monitor.db
+demo_injection_monitor.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+logs/

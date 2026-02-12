@@ -1,0 +1,13 @@
+openai-agents
+anthropic
+mcp[cli]
+google-auth
+google-auth-oauthlib
+google-api-python-client
+presidio-analyzer
+presidio-anonymizer
+spacy
+pysqlcipher3
+python-dotenv
+rich
+pytest
