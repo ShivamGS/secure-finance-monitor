@@ -30,6 +30,20 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("base64_block", re.compile(r"[A-Za-z0-9+/]{40,}={0,2}", re.IGNORECASE)),
 ]
 
+# Module-level pipeline statistics for chat mode display
+_last_pipeline_stats = {
+    "fetched": 0,
+    "blocked": 0,
+    "redacted": 0,
+    "injections": 0,
+    "stored": 0
+}
+
+
+def get_last_pipeline_stats() -> dict:
+    """Get the most recent pipeline statistics from tool execution."""
+    return dict(_last_pipeline_stats)
+
 
 @function_tool
 def scan_financial_emails(days: int = 30, max_results: int = 100) -> str:
@@ -98,6 +112,13 @@ def scan_financial_emails(days: int = 30, max_results: int = 100) -> str:
             skipped += 1
 
     logger.info(f"✅ Extracted {len(transactions)} transactions, skipped {skipped} non-financial emails")
+
+    # Update module-level stats for chat mode display
+    _last_pipeline_stats["fetched"] = len(emails)
+    _last_pipeline_stats["blocked"] = blocked_count
+    _last_pipeline_stats["redacted"] = total_redactions
+    _last_pipeline_stats["injections"] = 0  # Updated by check_prompt_injection if called
+    _last_pipeline_stats["stored"] = len(transactions)
 
     return json.dumps({
         'total_emails': len(emails),

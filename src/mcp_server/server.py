@@ -136,42 +136,70 @@ def fetch_financial_emails(days: int = 30, max_results: int = 50) -> dict:
             redaction_stats.add_result(redaction_result)
 
             # Capture first email with VISIBLE PII redactions as the demo example
-            if pii_example_before is None and redaction_result.redaction_count > 0:
-                # Strip HTML tags and find where redactions appear
+            if pii_example_before is None and redaction_result.redaction_count > 0 and redaction_result.redaction_details:
+                # Get the first redaction detail to build before/after example
+                first_redaction = redaction_result.redaction_details[0]
+
+                # Strip HTML tags and collapse whitespace
                 def strip_html(text: str) -> str:
                     """Remove HTML tags and collapse whitespace."""
                     clean = re.sub(r'<[^>]+>', ' ', text)
                     clean = re.sub(r'\s+', ' ', clean)
                     return clean.strip()
 
-                # Strip HTML FIRST, then find redaction position in stripped text
                 original_stripped = strip_html(full_email["body"])
                 redacted_stripped = strip_html(redaction_result.clean_text)
 
-                # Find first redaction tag in the STRIPPED redacted text
-                match = re.search(r'\[[\w_]+_REDACTED\]|\[CARD_\*\*\*\*\d+\]|\[ACCT_REDACTED\]', redacted_stripped)
+                # Find where the replacement tag appears in redacted text
+                replacement_tag = first_redaction.replacement
+                tag_pos = redacted_stripped.find(replacement_tag)
 
-                if match:
-                    # Found a redaction tag - center snippet around it
-                    tag_pos = match.start()
-                    # Take ~80 chars before and ~120 chars after the tag
-                    start = max(0, tag_pos - 80)
-                    end = min(len(redacted_stripped), tag_pos + 120)
+                if tag_pos != -1:
+                    # Center snippet around the redaction tag (~100 chars context on each side)
+                    start = max(0, tag_pos - 100)
+                    end = min(len(redacted_stripped), tag_pos + len(replacement_tag) + 100)
 
-                    # Use same window for both original and redacted
-                    before_snippet = original_stripped[start:end]
                     after_snippet = redacted_stripped[start:end]
 
-                    # Add ellipsis if truncated
+                    # For before snippet, try to find the original PII in the original text
+                    # Use the original value from redaction detail if available
+                    original_value = first_redaction.original if hasattr(first_redaction, 'original') and first_redaction.original else None
+
+                    if original_value:
+                        # Find original value in original text
+                        orig_pos = original_stripped.find(original_value)
+                        if orig_pos != -1:
+                            # Use same window size around original PII
+                            before_start = max(0, orig_pos - 100)
+                            before_end = min(len(original_stripped), orig_pos + len(original_value) + 100)
+                            before_snippet = original_stripped[before_start:before_end]
+
+                            # Add ellipsis markers
+                            if before_start > 0:
+                                before_snippet = "..." + before_snippet
+                            if before_end < len(original_stripped):
+                                before_snippet = before_snippet + "..."
+                        else:
+                            # Fallback: use same position (may not align perfectly but better than nothing)
+                            before_snippet = original_stripped[start:end]
+                            if start > 0:
+                                before_snippet = "..." + before_snippet
+                    else:
+                        # Fallback: use same position
+                        before_snippet = original_stripped[start:end]
+                        if start > 0:
+                            before_snippet = "..." + before_snippet
+
+                    # Add ellipsis for after snippet
                     if start > 0:
-                        before_snippet = "..." + before_snippet
                         after_snippet = "..." + after_snippet
                     if end < len(redacted_stripped):
-                        before_snippet = before_snippet + "..."
                         after_snippet = after_snippet + "..."
+                        if original_value and orig_pos != -1 and before_end < len(original_stripped):
+                            before_snippet = before_snippet + "..."
 
-                    # Only use this example if before and after are visibly different
-                    if before_snippet != after_snippet:
+                    # Only use if they're visibly different
+                    if before_snippet != after_snippet and len(before_snippet) > 20:
                         pii_example_before = before_snippet
                         pii_example_after = after_snippet
                         pii_example_count = redaction_result.redaction_count

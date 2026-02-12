@@ -603,14 +603,18 @@ def cmd_chat(args: argparse.Namespace, config: Config) -> None:
 
             # Chat with agent
             try:
-                # Task 5: Get response with pipeline metadata
+                # Get response from agent
                 response, metadata = agent.chat(user_input, return_metadata=True)
 
-                # Update metadata with audit count
-                metadata["audited"] = 1  # At least one audit event per chat
+                # Get pipeline stats from tools module (more reliable than SDK metadata)
+                from .agent.tools import get_last_pipeline_stats
+                pipeline_stats = get_last_pipeline_stats()
+
+                # Merge with audit count
+                pipeline_stats["audited"] = 1  # At least one audit event per chat
 
                 # Task 5: Display compact pipeline status + response
-                display.chat_response(metadata, response)
+                display.chat_response(pipeline_stats, response)
 
                 # Log to audit
                 audit.log_response_sent(
