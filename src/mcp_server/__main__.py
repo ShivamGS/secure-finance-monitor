@@ -1,4 +1,14 @@
-"""Allow running: python -m src.mcp_server.gmail_auth"""
-from .gmail_auth import run_auth_flow
+"""
+MCP Server main entry point.
 
-run_auth_flow()
+Run with: python -m src.mcp_server
+
+This starts the FastMCP server with stdio transport for communication with
+the OpenAI Agents SDK MCP client.
+"""
+
+from .server import mcp
+
+if __name__ == "__main__":
+    # Run with stdio transport (required for MCPServerStdio client)
+    mcp.run(transport="stdio")

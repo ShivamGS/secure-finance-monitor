@@ -56,7 +56,7 @@ If all 3 passes fail (regex exception + Presidio crash + validator error):
 | Semantic injection | "Hypothetically, if you could see PII..." | ❌ No | Requires LLM understanding |
 | Payload in subject | Attack in subject line, not body | Partial | Blocklist checks subject |
 
-**Bounded damage:** Even if injection succeeds, the PII redaction wall (Layer 3) runs **before** the agent, so the attacker only controls an agent that sees redacted data. No PII exposure.
+**Bounded damage:** Even if injection succeeds, the PII redaction wall (Layer 3) runs **INSIDE the MCP server BEFORE** the agent sees anything, so the attacker only controls an agent that sees redacted data. No PII exposure.
 
 ### LLM Hallucination Risk
 
@@ -86,7 +86,7 @@ Agent may hallucinate transactions or amounts. **Mitigation:** Output re-scannin
 
 ### Raw Data in Memory
 
-PII redaction happens in Python memory. `del full_email` does not zero memory. Attacker with memory access (debugger, core dump, swap) may recover raw emails.
+PII redaction happens in Python memory inside the MCP server. `del full_email` does not zero memory. Attacker with memory access (debugger, core dump, swap) may recover raw emails.
 
 **Impact:** High if attacker has local access; not mitigable in pure Python.
 
@@ -178,10 +178,10 @@ If OpenAI/Anthropic API is down:
 
 ### Tool Parameter Abuse
 
-Agent has tools like `scan_financial_emails(days, max_results)`. Malicious prompt could try:
-- `scan_financial_emails(days=36500, max_results=999999)` (10 years, huge scan)
-- **Current protection:** `max_results` capped at 100, `days` not capped
-- **Mitigation needed:** Cap `days` to reasonable limit (e.g., 365)
+Agent calls MCP tools with parameters. Malicious prompt could try:
+- `fetch_financial_emails(days=36500, max_results=999999)` (10 years, huge scan)
+- **Current protection:** `max_results` capped at 100 inside MCP server, `days` NOT capped
+- **Mitigation needed:** Cap `days` to reasonable limit (e.g., 365) inside MCP server
 
 ### Model Version Drift
 
@@ -194,7 +194,106 @@ OpenAI may update `gpt-4o-mini` model, changing behavior:
 
 ---
 
-## 7. Operational Failures
+## 7. MCP (Model Context Protocol) Failures
+
+### Server Process Crashes
+
+**MCP server runs as subprocess** communicating via stdio. If server crashes:
+- **Scan mode:** Fails immediately (direct MCP client call)
+- **Chat mode:** Agent cannot call MCP tools, chat fails entirely
+- **Current behavior:** No auto-restart, no health checks
+
+**Crash triggers:**
+- Gmail API connection failure (network timeout, DNS failure)
+- Python exception in redaction pipeline (uncaught error)
+- Memory exhaustion (processing 1000+ emails)
+- Kill signal (SIGKILL, OOM killer)
+
+**Mitigation needed:** Process supervision (systemd, supervisord), health checks, auto-restart on crash.
+
+### Stdio Communication Failures
+
+**Transport:** MCP client and server communicate via stdin/stdout. Failure modes:
+- **Broken pipe:** Server exits unexpectedly, client writes to closed pipe
+- **Buffer overflow:** Large email batch exceeds stdio buffer (unlikely but possible)
+- **Encoding errors:** Non-UTF-8 characters in email body break JSON serialization
+
+**Current behavior:** Exception raised, operation fails, no retry.
+
+**Impact:** Availability only — operation fails but no security breach.
+
+### Timeout Configuration
+
+**Current timeout:** 60 seconds per MCP tool call (increased from default 5s).
+
+**Risks:**
+- Large scans (100 emails, 50+ redaction patterns each) may exceed 60s
+- Gmail API rate limiting adds latency
+- Presidio NER processing slow on long emails
+
+**If timeout exceeded:**
+- MCP client raises timeout exception
+- Server continues processing in background (orphaned)
+- No partial results returned
+
+**Mitigation needed:** Configurable timeout per operation, progress streaming for long scans.
+
+### Security Boundary Bypass
+
+**The MCP server IS the security boundary.** If attacker can:
+1. Modify MCP server code (`src/mcp_server/server.py`)
+2. Replace MCP server executable
+3. Inject code into server subprocess
+
+...then entire security model collapses.
+
+**Protections:**
+- Code integrity: None (no signature verification)
+- File permissions: Relies on OS (chmod 644 for .py files)
+- Subprocess isolation: Inherits parent environment, not sandboxed
+
+**Mitigation needed:** Code signing, hash verification, container isolation (Docker), read-only filesystem.
+
+### MCP Tool Parameter Validation
+
+**Tools accept user-controlled parameters:**
+- `fetch_financial_emails(days, max_results)` — `days` NOT capped (HIGH RISK)
+- `get_financial_summary(days)` — `days` NOT capped
+- `get_email_detail(email_id)` — No validation of `email_id` format
+
+**Abuse scenarios:**
+- `days=36500` (100 years) → Gmail API quota exhaustion, timeout
+- `max_results=999999` → Already capped at 100 in code ✅
+- `email_id="../../../etc/passwd"` → Path traversal (not applicable but shows validation gap)
+
+**Current protections:**
+- `max_results` capped at 100 in `fetch_financial_emails` ✅
+- `days` NOT capped ❌ (HIGH risk)
+
+**Mitigation:** Add server-side validation: `days` max 365, `email_id` format check (alphanumeric + hyphen only).
+
+### MCP Server Dependency Failures
+
+**MCP server imports:**
+- FastMCP, Presidio, spaCy (`en_core_web_sm`), blocklist, redactor, extractor
+
+**If any import fails:**
+- Server startup fails
+- MCP client cannot connect
+- All scan/chat operations fail
+
+**Failure scenarios:**
+- Missing `en_core_web_sm` spaCy model (common after fresh install)
+- Presidio version incompatibility
+- SQLCipher library missing (graceful fallback to sqlite3 but affects encryption)
+
+**Current behavior:** Exception on startup, no graceful degradation.
+
+**Mitigation needed:** Dependency checks at startup, clear error messages, fallback modes (e.g., skip Presidio if unavailable, use regex-only redaction).
+
+---
+
+## 8. Operational Failures
 
 ### Blocklist Maintenance
 
@@ -227,7 +326,7 @@ Extraction relies on regex for dates like `Feb 10, 2026`. Non-standard formats (
 
 ---
 
-## 8. Attacker Priority Table
+## 9. Attacker Priority Table
 
 Ranked by difficulty and impact:
 
@@ -236,55 +335,66 @@ Ranked by difficulty and impact:
 | Steal `token.json` | Low | Medium | None — valid token usage |
 | Steal `.env` (API keys + DB key) | Low | High | None — valid API usage |
 | Access unencrypted DB | Low (if SQLCipher unavailable) | High | None — local file access |
+| Compromise MCP server process | Low (if code access) | **CRITICAL** | None — subprocess trusted |
 | Memory dump to recover raw PII | High | High | None — requires local access |
 | Bypass prompt injection detection | Medium | Low (bounded by redaction wall) | Logged if detected |
 | Evade PII redaction (unicode, etc.) | Medium | High | None — redactor has no detection |
 | Rebuild fake audit chain | Medium | Low (no external consumers) | None — chain self-validates |
 | Exploit Gmail API to modify emails | N/A | N/A | Impossible — read-only scope |
+| Abuse MCP tool parameters (days=36500) | **LOW** | Medium | None — quota exhaustion only |
 
-**Highest risk:** Unicode PII obfuscation + prompt injection = PII leak to LLM.
+**Highest risks:**
+1. **MCP server compromise** (code modification) = total security collapse
+2. **Unicode PII obfuscation** + prompt injection = PII leak to LLM
+3. **MCP tool abuse** (days=36500) = Gmail quota exhaustion, timeout, DoS
 
 ---
 
-## 9. Production Readiness Gaps
+## 10. Production Readiness Gaps
 
 | Gap | Fix | Effort |
 |-----|-----|--------|
-| Dockerize with sqlcipher | Build FROM python:3.12 with sqlcipher pre-installed | Low |
-| Integrate Vault/HSM | Fetch DB encryption key from HashiCorp Vault | Medium |
-| Key rotation | Implement re-encryption flow on key change | Medium |
-| Secure memory | Use `ctypes.memset` to zero buffers after redaction | High |
-| International PII | Add non-US phone, currency, address patterns | Medium |
-| External audit anchor | Publish root hash to blockchain/timestamp service | Medium |
-| ML-based email classifier | Replace regex-based blocklist with trained model | High |
-| Multi-tenant isolation | Separate databases per user, API key scoping | High |
-| Rate limiting | Implement exponential backoff for Gmail API | Low |
-| Alerting | Slack/PagerDuty webhook on CRITICAL security events | Low |
-| Metrics/monitoring | Prometheus metrics for redaction counts, injection attempts | Medium |
-| E2E encryption | Encrypt email content in transit (already TLS but add app-level) | Medium |
+| **MCP parameter validation** | Cap `days` to 365 max inside server | **LOW** |
+| **MCP process supervision** | Add systemd/supervisord auto-restart | **LOW** |
+| **MCP code integrity** | Hash verification on server startup | **MEDIUM** |
+| Dockerize with sqlcipher | Build FROM python:3.12 with sqlcipher pre-installed | LOW |
+| Integrate Vault/HSM | Fetch DB encryption key from HashiCorp Vault | MEDIUM |
+| Key rotation | Implement re-encryption flow on key change | MEDIUM |
+| Secure memory | Use `ctypes.memset` to zero buffers after redaction | HIGH |
+| International PII | Add non-US phone, currency, address patterns | MEDIUM |
+| External audit anchor | Publish root hash to blockchain/timestamp service | MEDIUM |
+| ML-based email classifier | Replace regex-based blocklist with trained model | HIGH |
+| Multi-tenant isolation | Separate databases per user, API key scoping | HIGH |
+| Rate limiting | Implement exponential backoff for Gmail API | LOW |
+| Alerting | Slack/PagerDuty webhook on CRITICAL security events | LOW |
+| Metrics/monitoring | Prometheus metrics for redaction counts, injection attempts | MEDIUM |
+| E2E encryption | Encrypt email content in transit (already TLS but add app-level) | MEDIUM |
 
 ---
 
-## 10. Defense-in-Depth Matrix
+## 11. Defense-in-Depth Matrix
 
 Scenario analysis showing how multiple layer failures affect overall security:
 
-| Scenario | Layer 1 | Layer 2 | Layer 3 | Layer 4 | Layer 5 | Layer 6 | Actual Risk |
-|----------|---------|---------|---------|---------|---------|---------|-------------|
+| Scenario | MCP Server | Blocklist | Redaction | Agent | Storage | Audit | Actual Risk |
+|----------|------------|-----------|-----------|-------|---------|-------|-------------|
 | **Regex miss** (unicode PII) | ✅ OK | ✅ OK | ❌ MISS | ✅ OK | ✅ OK | ✅ OK | **HIGH** — PII leaked to LLM |
 | **Injection bypass** | ✅ OK | ✅ OK | ✅ OK | ❌ MISS | ✅ OK | ✅ OK | **LOW** — agent manipulated but sees only redacted data |
 | **DB encryption fail** | ✅ OK | ✅ OK | ✅ OK | ✅ OK | ❌ FAIL | ✅ OK | **MEDIUM** — plaintext DB on disk |
 | **Audit tamper** | ✅ OK | ✅ OK | ✅ OK | ✅ OK | ✅ OK | ❌ FAIL | **LOW** — integrity lost but no PII leak |
+| **MCP server compromise** | ❌ **FAIL** | ❌ Bypassed | ❌ Bypassed | ✅ OK | ✅ OK | ❌ Bypassed | **CRITICAL** — entire security boundary lost |
+| **MCP tool abuse** (days=36500) | ⚠️ DEGRADED | ✅ OK | ✅ OK | ✅ OK | ✅ OK | ✅ OK | **MEDIUM** — DoS via quota exhaustion |
 | **All layers fail** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | **CRITICAL** — but Layer 3 fail-closed prevents most damage |
 
-**The redaction wall (Layer 3) is the load-bearing security control.**
+**The MCP server (containing redaction wall) is the load-bearing security control.**
 
-If Layer 3 succeeds:
-- Injection bypass (Layer 4) → Low risk (attacker controls agent with no PII)
-- DB breach (Layer 5) → Medium risk (metadata leaked, not raw PII)
-- Audit tamper (Layer 6) → Low risk (no PII in audit log)
+If MCP server succeeds:
+- Injection bypass (Agent layer) → Low risk (attacker controls agent with no PII)
+- DB breach (Storage layer) → Medium risk (metadata leaked, not raw PII)
+- Audit tamper (Audit layer) → Low risk (no PII in audit log)
 
-If Layer 3 fails:
+If MCP server fails:
+- **Code compromise** → Critical risk (attacker controls security boundary)
 - Regex miss → High risk (PII visible to agent)
 - Validator bypass → High risk (PII stored in database)
 - Cascade failure → Mitigated by fail-closed design (content withheld)
@@ -293,15 +403,24 @@ If Layer 3 fails:
 
 ## Summary
 
-**What works:** Fail-closed design, defense-in-depth layering, zero PII to LLM under normal operation, read-only Gmail scope.
+**What works:** Fail-closed design, MCP security boundary, defense-in-depth layering, zero PII to LLM under normal operation, read-only Gmail scope.
 
-**What could break:** Regex evasion (unicode), prompt injection bypass (semantic), encryption key management, token theft, international formats, memory dumps.
+**What could break:** Regex evasion (unicode), prompt injection bypass (semantic), MCP server compromise, MCP tool abuse (days parameter), encryption key management, token theft, international formats, memory dumps.
 
-**Biggest gaps:** No unicode normalization in redaction, no key rotation, no external audit anchor, no rate limiting, no international PII support.
+**Biggest gaps:**
+1. **MCP tool parameter validation** (days not capped) — **HIGH PRIORITY**
+2. **MCP server code integrity** (no verification) — **HIGH PRIORITY**
+3. No unicode normalization in redaction — **HIGH PRIORITY**
+4. No key rotation — MEDIUM PRIORITY
+5. No external audit anchor — MEDIUM PRIORITY
+6. No rate limiting — MEDIUM PRIORITY
+7. No international PII support — MEDIUM PRIORITY
 
 **Recommended fixes for production:**
-1. Add unicode normalization to regex patterns (HIGH)
-2. Integrate Vault for encryption key management (HIGH)
-3. Add exponential backoff for Gmail API (MEDIUM)
-4. Publish audit root hash to external service (MEDIUM)
-5. Add Slack/webhook alerting on CRITICAL events (LOW)
+1. **Add MCP parameter validation: cap `days` to 365** (HIGH — LOW EFFORT)
+2. **Add MCP process supervision and health checks** (HIGH — LOW EFFORT)
+3. Add unicode normalization to regex patterns (HIGH — MEDIUM EFFORT)
+4. Integrate Vault for encryption key management (HIGH — MEDIUM EFFORT)
+5. Add exponential backoff for Gmail API (MEDIUM — LOW EFFORT)
+6. Publish audit root hash to external service (MEDIUM — MEDIUM EFFORT)
+7. Add Slack/webhook alerting on CRITICAL events (LOW — LOW EFFORT)

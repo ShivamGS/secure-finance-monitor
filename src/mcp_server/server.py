@@ -82,36 +82,72 @@ def _extract_amounts(text: str) -> list[str]:
 
 
 @mcp.tool()
-def fetch_financial_emails(days: int = 30, max_results: int = 50) -> dict:
+def fetch_financial_emails(days: int = 30, max_results: int = 50) -> str:
     """
-    Fetch recent financial emails from Gmail, with all PII redacted.
+    Fetch financial emails from Gmail and extract sanitized transaction data.
+
+    SECURITY PIPELINE (runs entirely in MCP server):
+    1. Fetch from Gmail API
+    2. Apply blocklist (filter spam/promo)
+    3. Apply PII redaction (3-pass pipeline)
+    4. Extract transactions (regex-based, no LLM)
+    5. Return ONLY sanitized transaction metadata
+
+    The agent NEVER sees raw email bodies - only extracted transaction data.
 
     Args:
         days: Number of days to look back (default 30)
-        max_results: Maximum number of emails to return (default 50)
+        max_results: Maximum number of emails to return (default 50, max 100)
 
     Returns:
-        Dictionary with sanitized emails and summary statistics.
-        Each email includes: id, sender, subject, date, redacted_body, redaction_report
+        JSON string with transactions and pipeline statistics
     """
+    import json
+    from ..config.blocklist import get_blocklist
+    from ..agent.extractor import extract_transaction
+    from ..agent.tools import check_prompt_injection_raw, _infer_category_local
+
     max_results = min(max_results, int(os.getenv("MAX_EMAILS_PER_SCAN", "100")))
 
+    # LAYER 1: Fetch from Gmail API
     try:
         client = _get_gmail_client()
         query = client.build_financial_query(days=days)
         email_list = client.search_emails(query, max_results=max_results)
+        logger.info(f"📧 Fetched {len(email_list)} emails from Gmail")
     except Exception as e:
         logger.error("Gmail API error in fetch_financial_emails: %s", e)
-        return {"error": f"Failed to fetch emails: {e}", "emails": []}
+        return json.dumps({"error": f"Failed to fetch emails: {e}", "transactions": [], "pipeline_stats": {}})
 
-    sanitized_emails = []
+    # LAYER 2: Apply blocklist filter
+    blocklist = get_blocklist()
+    emails_after_blocklist = []
+    blocked_count = 0
+
+    for email_meta in email_list:
+        sender = email_meta.get("sender", "")
+        subject = email_meta.get("subject", "")
+        is_blocked, reason = blocklist.is_blocked(sender, subject)
+
+        if is_blocked:
+            blocked_count += 1
+            logger.debug(f"Blocked email by {reason}: {subject[:50]}")
+        else:
+            emails_after_blocklist.append(email_meta)
+
+    logger.info(f"🚫 Blocklist filtered out {blocked_count}/{len(email_list)} emails")
+    email_list = emails_after_blocklist
+
+    # LAYER 3: PII Redaction + LAYER 4: Transaction Extraction
+    transactions = []
     total_redactions = 0
+    injections_detected = 0
+    failed_redaction_count = 0
 
-    # Task 8: Collect redaction statistics for Cequence demo
+    # Collect redaction statistics for demo display
     redaction_stats = RedactionStats()
 
-    # Task 4: Capture ONE before/after example for demo (THE MONEY SHOT)
-    # This raw snippet is only for terminal display, never sent to LLM
+    # Capture ONE before/after example for demo (THE MONEY SHOT)
     pii_example_before = None
     pii_example_after = None
     pii_example_count = 0
@@ -123,7 +159,7 @@ def fetch_financial_emails(days: int = 30, max_results: int = 50) -> dict:
             logger.error("Failed to fetch body for email %s: %s", email_meta["id"], e)
             continue
 
-        # SECURITY: Redact BEFORE returning — no exceptions
+        # LAYER 3: PII Redaction - SECURITY: Redact BEFORE any processing
         try:
             # Get the full redaction result to collect stats
             redaction_result = _redactor.redact(full_email["body"])
@@ -134,6 +170,7 @@ def fetch_financial_emails(days: int = 30, max_results: int = 50) -> dict:
 
             # Collect stats
             redaction_stats.add_result(redaction_result)
+            total_redactions += redaction_result.redaction_count
 
             # Capture first email with VISIBLE PII redactions as the demo example
             if pii_example_before is None and redaction_result.redaction_count > 0 and redaction_result.redaction_details:
@@ -204,63 +241,68 @@ def fetch_financial_emails(days: int = 30, max_results: int = 50) -> dict:
                         pii_example_after = after_snippet
                         pii_example_count = redaction_result.redaction_count
 
-            redacted = {
-                "redacted_body": redaction_result.clean_text,
-                "redaction_report": {
-                    "redaction_count": redaction_result.redaction_count,
-                    "is_valid": redaction_result.is_valid,
-                    "validation_issues": redaction_result.validation_issues,
-                    "details": [
-                        {
-                            "type": d.pattern_name,
-                            "replacement": d.replacement,
-                        }
-                        for d in redaction_result.redaction_details
-                    ],
-                },
-            }
-        except RuntimeError:
-            # FAIL CLOSED: redaction failed, skip this email entirely
-            logger.error(
-                "Redaction failed for email %s — content withheld", email_meta["id"]
-            )
-            sanitized_emails.append(
-                {
-                    "id": email_meta["id"],
-                    "sender": email_meta.get("sender", ""),
-                    "subject": email_meta.get("subject", ""),
-                    "date": email_meta.get("date", ""),
-                    "redacted_body": "[REDACTION_FAILED: content withheld]",
-                    "redaction_report": {"error": "Redaction pipeline failed"},
-                }
-            )
-            continue
+            # LAYER 4: Prompt Injection Detection
+            redacted_body = redaction_result.clean_text
+            injection_result = check_prompt_injection_raw(redacted_body)
+            if injection_result["is_suspicious"]:
+                injections_detected += 1
+                logger.warning(f"⚠️  Injection detected in email {email_meta['id']}: {injection_result['patterns_found']}")
 
-        total_redactions += redacted["redaction_report"]["redaction_count"]
-        sanitized_emails.append(
-            {
+            # LAYER 4: Transaction Extraction (regex-based, no LLM)
+            email_for_extraction = {
                 "id": email_meta["id"],
                 "sender": email_meta.get("sender", ""),
                 "subject": email_meta.get("subject", ""),
                 "date": email_meta.get("date", ""),
-                "redacted_body": redacted["redacted_body"],
-                "redaction_report": redacted["redaction_report"],
+                "body": redacted_body,  # Already sanitized
             }
-        )
+
+            extracted = extract_transaction(email_for_extraction)
+            if extracted:
+                # Quick categorization using local keyword matching
+                category = _infer_category_local(
+                    extracted.get("merchant", ""),
+                    email_meta.get("subject", "")
+                )
+
+                transaction = {
+                    "source_email_id": extracted.get("email_id", ""),
+                    "merchant": extracted.get("merchant", "Unknown"),
+                    "amount": extracted.get("amount", 0.0),
+                    "date": extracted.get("date", email_meta.get("date", "")),
+                    "category": category,
+                    "payment_method_type": extracted.get("payment_method_type"),
+                    "subject": email_meta.get("subject", ""),
+                }
+                transactions.append(transaction)
+
+        except RuntimeError:
+            # FAIL CLOSED: redaction failed, skip this email entirely
+            failed_redaction_count += 1
+            logger.error(
+                "Redaction failed for email %s — content withheld", email_meta["id"]
+            )
+            continue
 
         # Discard the raw body — it must not persist beyond this function
         del full_email
 
-    return {
-        "emails": sanitized_emails,
-        "total_emails": len(sanitized_emails),
-        "total_redactions": total_redactions,
-        "query_days": days,
-        "audit_summary": (
-            f"{len(sanitized_emails)} emails fetched, "
-            f"{total_redactions} PII items redacted"
-        ),
-        # Task 8: Include redaction stats for demo display
+    # Calculate total amount
+    total_amount = sum(t["amount"] for t in transactions)
+
+    # Return as JSON string (MCP tools return strings)
+    result = {
+        "transactions": transactions,
+        "total_transactions": len(transactions),
+        "total_amount": total_amount,
+        "pipeline_stats": {
+            "fetched": len(email_list) + blocked_count,  # Original count before blocklist
+            "blocked": blocked_count,
+            "redacted": total_redactions,
+            "failed_closed": failed_redaction_count,
+            "injections": injections_detected,
+            "extracted": len(transactions),
+        },
         "redaction_stats": {
             "total_emails": redaction_stats.total_emails,
             "total_redactions": redaction_stats.total_redactions,
@@ -268,13 +310,16 @@ def fetch_financial_emails(days: int = 30, max_results: int = 50) -> dict:
             "by_pass": dict(redaction_stats.by_pass),
             "failed_emails": redaction_stats.failed_emails,
         },
-        # Task 4: Include one PII example for demo (THE MONEY SHOT)
         "pii_example": {
             "before": pii_example_before,
             "after": pii_example_after,
             "redaction_count": pii_example_count,
         } if pii_example_before else None,
+        "query_days": days,
     }
+
+    logger.info(f"✅ Extracted {len(transactions)} transactions, total: ${total_amount:.2f}")
+    return json.dumps(result)
 
 
 @mcp.tool()
@@ -418,6 +463,13 @@ def get_financial_summary(days: int = 7) -> dict:
         "transactions": transactions,
         "total_transactions": len(transactions),
         "total_redactions": total_redactions,
+        "pipeline_stats": {
+            "fetched": len(email_list) + blocked_count,  # Original count before blocklist
+            "blocked": blocked_count,
+            "redacted": total_redactions,
+            "injections": 0,  # Not tracked in this function
+            "extracted": len(transactions),
+        },
         "query_days": days,
         "audit_summary": (
             f"{len(transactions)} financial transactions found over {days} days, "

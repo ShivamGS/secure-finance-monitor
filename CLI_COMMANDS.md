@@ -45,7 +45,7 @@ python -m src.main chat
 
 **What it does**:
 - Uses OpenAI Agents SDK to understand your questions
-- Calls `scan_financial_emails` tool to fetch data
+- Calls MCP tools (fetch_financial_emails, get_financial_summary) via secure protocol
 - Analyzes and responds with structured JSON or natural language
 - All responses sanitized for PII
 
@@ -130,7 +130,30 @@ python -m src.main demo
 
 ---
 
-### 7. `audit` - Show Audit Log
+### 7. `demo-injection` - Prompt Injection Defense Demo
+**Purpose**: Demonstrate prompt injection detection capabilities
+
+```bash
+python -m src.main demo-injection
+```
+
+**What it does**:
+- Tests system against common prompt injection attacks
+- Shows how redaction wall bounds damage even if injection succeeds
+- Demonstrates 10 injection patterns caught by security scanner
+- Uses sample malicious emails with injection payloads
+
+**What it shows**:
+- ✅ Detected injections (pattern matched, blocked)
+- ⚠️ Bypass attempts (injection succeeded but agent sees only redacted data)
+- 🔒 Security boundary in action (MCP server filters all PII before agent)
+
+**Use case**: Security demonstrations, testing injection detection, compliance review
+
+---
+
+
+### 11. `audit` - Show Audit Log
 **Purpose**: View security audit trail (tamper-evident hash chain)
 
 ```bash
@@ -151,7 +174,7 @@ python -m src.main audit --verify-chain    # Verify hash chain integrity
 
 ---
 
-### 8. `verify` - Verify System Integrity
+### 11. `verify` - Verify System Integrity
 **Purpose**: Run comprehensive security and integrity checks
 
 ```bash
@@ -172,7 +195,7 @@ python -m src.main verify
 
 ---
 
-### 9. `test-gmail` - Test Gmail Connectivity
+### 11. `test-gmail` - Test Gmail Connectivity
 **Purpose**: Verify Gmail OAuth setup without processing emails
 
 ```bash
@@ -190,12 +213,12 @@ python -m src.main test-gmail
 
 ---
 
-### 10. `reset` - Clear All Data
+### 11. `reset` - Clear All Data
 **Purpose**: Delete database and audit log (⚠️ DESTRUCTIVE)
 
 ```bash
 python -m src.main reset                   # Prompts for confirmation
-python -m src.main reset --force           # Skip confirmation (use with caution!)
+python -m src.main reset --confirm           # Skip confirmation (use with caution!)
 ```
 
 **What it deletes**:
@@ -287,7 +310,7 @@ python -m src.main audit --verify-chain
 python -m src.main demo
 
 # Test with fresh data
-python -m src.main reset --force
+python -m src.main reset --confirm
 python -m src.main scan --days 3
 ```
 

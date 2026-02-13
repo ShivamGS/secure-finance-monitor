@@ -1,24 +1,31 @@
 """
-Finance monitoring agent built on OpenAI Agents SDK.
+Finance monitoring agent built on OpenAI Agents SDK with MCP integration.
 
-The agent NEVER sees raw email data — it only receives pre-redacted content
-from the MCP server (enforced in Phase 2). This module is the CONSUMER
-of clean data, not the processor of raw data.
+ARCHITECTURE:
+  The agent connects to the MCP server as a proper MCP client using MCPServerStdio.
+  The MCP server runs the full security pipeline (blocklist → PII redaction → extraction)
+  and returns ONLY sanitized transaction data to the agent.
 
-Defense in depth: even though input is pre-redacted, the agent's output
-is also scanned through the PII redactor before returning to the user.
+  Agent NEVER sees raw email bodies - only extracted transaction metadata.
+
+SECURITY:
+  - Input is sanitized by MCP server (Layer 1-3 of security pipeline)
+  - Output is re-scanned by PIIRedactor (defense in depth)
+  - Prompt injection detection happens in both MCP server and agent
 """
 
 import json
 import logging
 import os
+import asyncio
 from dataclasses import dataclass, field
 
 from agents import Agent, Runner
+from agents.mcp import MCPServerStdio, MCPServerStdioParams
 
 from .prompts import FINANCE_AGENT_SYSTEM_PROMPT
 from .tools import (
-    scan_financial_emails,
+    # Local tools only - MCP tools are auto-discovered
     categorize_transaction,
     detect_anomalies,
     generate_summary,
@@ -41,26 +48,47 @@ class ScanResult:
 
 class FinanceAgent:
     """
-    Secure personal finance monitoring agent.
+    Secure personal finance monitoring agent with MCP integration.
 
-    Wraps the OpenAI Agents SDK Agent with security guardrails:
-    - All input is pre-redacted (enforced by MCP server)
-    - All output is post-scanned for PII (defense in depth)
-    - Prompt injection is detected and flagged
+    ARCHITECTURE:
+      - Connects to MCP server via MCPServerStdio (stdio transport)
+      - MCP server auto-discovered tools: fetch_financial_emails, get_email_detail
+      - Local tools: categorize_transaction, detect_anomalies, etc.
+      - Agent receives ONLY sanitized transaction data from MCP server
+
+    SECURITY:
+      - Input sanitized by MCP server (blocklist → PII redaction → extraction)
+      - Output post-scanned by PIIRedactor (defense in depth)
+      - Prompt injection detected at both MCP and agent layers
     """
 
     def __init__(self) -> None:
         model = os.getenv("AGENT_MODEL", "gpt-4o-mini")
 
-        self._agent = Agent(
+        # MCP server connection (stdio transport)
+        self.mcp_server = MCPServerStdio(
+            params=MCPServerStdioParams(
+                command="python",
+                args=["-m", "src.mcp_server"],
+                cwd=os.getcwd(),
+                env=os.environ.copy(),
+                encoding="utf-8",
+            ),
             name="SecureFinanceMonitor",
+            client_session_timeout_seconds=60.0,  # Allow 60s for large email batches
+        )
+
+        # Agent with MCP tools + local tools
+        self._agent = Agent(
+            name="SecureFinanceAgent",
             instructions=FINANCE_AGENT_SYSTEM_PROMPT,
             model=model,
+            mcp_servers=[self.mcp_server],  # Auto-discovers MCP tools
             tools=[
-                scan_financial_emails,
+                # Local tools only (non-MCP)
+                # Note: generate_summary removed - use MCP get_financial_summary instead
                 categorize_transaction,
                 detect_anomalies,
-                generate_summary,
                 check_prompt_injection,
             ],
         )
@@ -203,12 +231,17 @@ class FinanceAgent:
 
         return result
 
-    def chat(self, user_message: str, return_metadata: bool = False) -> str | tuple[str, dict]:
+    async def chat(self, user_message: str, return_metadata: bool = False) -> str | tuple[str, dict]:
         """
-        Interactive chat with the finance agent.
+        Interactive chat with the finance agent (ASYNC).
 
         The agent can answer questions about spending, transactions, etc.
         All responses are post-scanned for PII (defense in depth).
+
+        MCP Integration:
+          - Agent calls MCP tools via protocol (fetch_financial_emails)
+          - MCP server returns sanitized transaction data + pipeline stats
+          - Agent never sees raw email bodies
 
         Args:
             user_message: The user's question
@@ -228,70 +261,116 @@ class FinanceAgent:
 
         try:
             logger.info("🤖 Agent processing: %s", user_message[:100])
-            run_result = Runner.run_sync(
-                self._agent,
-                input=user_message,
-                max_turns=10,  # Increased from 5 to allow more tool calls
-            )
 
-            # Collect metadata from tool calls (Task 5: Cequence demo)
-            if hasattr(run_result, 'steps'):
-                for i, step in enumerate(run_result.steps):
-                    if hasattr(step, 'tool_calls') and step.tool_calls:
-                        for tool_call in step.tool_calls:
-                            logger.info(f"🔧 Tool call {i+1}: {tool_call.name}")
+            # MCP server lifecycle management
+            async with self.mcp_server:
+                run_result = await Runner.run(
+                    self._agent,
+                    input=user_message,
+                    max_turns=10,  # Allow multiple tool calls
+                )
 
-                            # Parse tool results to extract pipeline stats
-                            if tool_call.name in ["scan_financial_emails", "generate_summary"]:
-                                # Check multiple possible result locations in OpenAI Agents SDK format
+                # Extract pipeline stats from MCP tool results
+                # Check new_items which contains all conversation items including tool results
+                if hasattr(run_result, 'new_items') and run_result.new_items:
+                    logger.debug(f"Found {len(run_result.new_items)} new items")
+                    last_tool_call_name = None
+
+                    for i, item in enumerate(run_result.new_items):
+                        item_type = type(item).__name__
+                        logger.debug(f"Item {i}: type={item_type}")
+
+                        # Track ToolCallItem to get the tool name
+                        if item_type == 'ToolCallItem':
+                            # Try to get tool name from raw_item
+                            if hasattr(item, 'raw_item'):
+                                raw = item.raw_item
+                                logger.debug(f"raw_item type: {type(raw)}, has name: {hasattr(raw, 'name') if hasattr(raw, '__dict__') else 'N/A'}")
+                                if hasattr(raw, 'name'):
+                                    last_tool_call_name = raw.name
+                                    logger.debug(f"Found tool call from raw_item.name: {last_tool_call_name}")
+                                elif hasattr(raw, 'function') and hasattr(raw.function, 'name'):
+                                    last_tool_call_name = raw.function.name
+                                    logger.debug(f"Found tool call from raw_item.function.name: {last_tool_call_name}")
+                            elif hasattr(item, 'name'):
+                                last_tool_call_name = item.name
+                                logger.debug(f"Found tool call (name): {last_tool_call_name}")
+
+                        # ToolCallOutputItem contains the result of the previous tool call
+                        elif item_type == 'ToolCallOutputItem' or item_type == 'ToolResultItem' or (hasattr(item, 'role') and item.role == 'tool'):
+                            logger.debug(f"Found tool output for: {last_tool_call_name}")
+
+                            # Extract stats from both MCP financial tools
+                            if last_tool_call_name in ['fetch_financial_emails', 'get_financial_summary']:
+                                logger.info(f"🔧 Found result for {last_tool_call_name}")
+
+                                # Extract content from the tool result item
                                 tool_result_output = None
 
-                                # Method 1: Check step.tool_results
-                                if hasattr(step, 'tool_results') and step.tool_results:
-                                    tool_result_output = step.tool_results[0].output if len(step.tool_results) > 0 else None
-
-                                # Method 2: Check tool_call.result (alternative SDK format)
-                                elif hasattr(tool_call, 'result'):
-                                    tool_result_output = tool_call.result
-
-                                # Method 3: Check step.output (another possible location)
-                                elif hasattr(step, 'output'):
-                                    tool_result_output = step.output
+                                # Try to get content from the item
+                                if hasattr(item, 'content'):
+                                    content = item.content
+                                    # Content might be a list of content blocks
+                                    if isinstance(content, list) and len(content) > 0:
+                                        first_block = content[0]
+                                        if hasattr(first_block, 'text'):
+                                            tool_result_output = first_block.text
+                                        elif isinstance(first_block, dict) and 'text' in first_block:
+                                            tool_result_output = first_block['text']
+                                        else:
+                                            tool_result_output = str(first_block)
+                                    elif isinstance(content, str):
+                                        tool_result_output = content
+                                elif hasattr(item, 'output'):
+                                    tool_result_output = item.output
+                                elif hasattr(item, 'result'):
+                                    tool_result_output = item.result
 
                                 if tool_result_output:
                                     try:
-                                        # Parse JSON result
+                                        # Parse JSON result from MCP tool
                                         if isinstance(tool_result_output, str):
                                             result_data = json.loads(tool_result_output)
                                         elif isinstance(tool_result_output, dict):
-                                            result_data = tool_result_output
+                                            # Check if the dict has a 'text' key containing the JSON
+                                            if 'text' in tool_result_output:
+                                                result_data = json.loads(tool_result_output['text'])
+                                            else:
+                                                result_data = tool_result_output
                                         else:
+                                            logger.debug(f"Unexpected tool result type: {type(tool_result_output)}")
                                             continue
 
-                                        # Extract metadata from result
-                                        if result_data.get("total_emails") is not None:
-                                            metadata["fetched"] = result_data["total_emails"]
-                                        if result_data.get("blocked_count") is not None:
-                                            metadata["blocked"] = result_data["blocked_count"]
-                                        if result_data.get("transactions_found") is not None:
-                                            metadata["stored"] = result_data["transactions_found"]
-                                        if result_data.get("total_transactions") is not None:
-                                            metadata["stored"] = result_data["total_transactions"]
-                                        if result_data.get("total_redactions") is not None:
-                                            metadata["redacted"] = result_data["total_redactions"]
+                                        # Extract pipeline_stats (new MCP format)
+                                        if "pipeline_stats" in result_data:
+                                            stats = result_data["pipeline_stats"]
+                                            metadata["fetched"] = stats.get("fetched", 0)
+                                            metadata["blocked"] = stats.get("blocked", 0)
+                                            metadata["redacted"] = stats.get("redacted", 0)
+                                            metadata["injections"] = stats.get("injections", 0)
+                                            metadata["stored"] = stats.get("extracted", 0)  # extracted = stored
+                                            logger.info(f"📊 Pipeline stats extracted: Fetched={metadata['fetched']}, Blocked={metadata['blocked']}, Redacted={metadata['redacted']}")
+                                        else:
+                                            logger.warning(f"No pipeline_stats in result_data. Keys: {list(result_data.keys())}")
 
-                                        logger.debug(f"📊 Metadata extracted: {metadata}")
                                     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
-                                        logger.warning(f"Failed to parse tool result metadata: {e}")
+                                        logger.warning(f"Failed to parse MCP tool result: {e}")
+                                        logger.debug(f"Tool result output type: {type(tool_result_output)}, content: {str(tool_result_output)[:200]}")
+                                else:
+                                    logger.warning(f"No tool result output found for {last_tool_call_name}")
 
-            raw_response = run_result.final_output or ""
-            logger.info("✅ Agent response generated (%d chars)", len(raw_response))
+                raw_response = run_result.final_output or ""
+                logger.info("✅ Agent response generated (%d chars)", len(raw_response))
+
         except Exception as e:
             logger.error("Agent chat failed: %s", e, exc_info=True)
             raw_response = f"I encountered an error processing your request: {e}"
 
         # Defense in depth: scan output for any PII that shouldn't be there
         sanitized = self.sanitize_response(raw_response)
+
+        # Add audit count
+        metadata["audited"] = 1
 
         if return_metadata:
             return sanitized, metadata

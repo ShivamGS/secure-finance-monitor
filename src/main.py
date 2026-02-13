@@ -52,7 +52,7 @@ for noisy_logger in [
     "google", "googleapiclient", "google.auth", "google_auth_httplib2",
     "mcp", "mcp.server", "mcp.server.lowlevel", "mcp.server.lowlevel.server",
     "asyncio",
-    "src.agent.extractor", "src.agent.finance_agent"
+    "src.agent.extractor"  # Removed finance_agent to see pipeline stats logs
 ]:
     logging.getLogger(noisy_logger).setLevel(logging.CRITICAL)
 
@@ -122,8 +122,12 @@ def init_components(config: Config, demo_mode: bool = False, suppress_stderr: bo
         handle_error("Failed to initialize components", e)
 
 
-def cmd_scan(args: argparse.Namespace, config: Config) -> None:
-    """Run a full Gmail financial scan with visible security pipeline."""
+async def async_cmd_scan(args: argparse.Namespace, config: Config) -> None:
+    """Run a full Gmail financial scan via MCP protocol (ASYNC)."""
+    import json
+    import os
+    from agents.mcp import MCPServerStdio, MCPServerStdioParams
+
     # Check Gmail credentials
     if not config.has_gmail_credentials():
         error_console.print("[bold red]Gmail credentials not found![/bold red]")
@@ -137,7 +141,6 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> None:
 
     # Handle --fresh flag
     if args.fresh:
-        import os
         console.print("\n[yellow]--fresh flag: clearing existing data...[/yellow]")
         if Path(config.db_path).exists():
             os.remove(config.db_path)
@@ -147,7 +150,7 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> None:
             console.print(f"[green]✓[/green] Cleared {config.audit_log_path}")
 
     # Suppress CRITICAL stderr output during scan (shown in LAYER 6 instead)
-    db, audit, agent = init_components(config, suppress_stderr=True)
+    db, audit, _ = init_components(config, suppress_stderr=True)
 
     # Task 4: Initialize PipelineDisplay for Cequence demo
     display = PipelineDisplay()
@@ -159,52 +162,87 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> None:
     audit.log_scan_start(days=args.days, max_results=args.max_results)
     audit_events_count = 1
 
-    try:
-        # STAGE 2: MCP - Fetch emails from Gmail
-        from .mcp_server.server import fetch_financial_emails
-        email_data = fetch_financial_emails(days=args.days, max_results=args.max_results)
+    # MCP client connection
+    mcp_client = MCPServerStdio(
+        params=MCPServerStdioParams(
+            command="python",
+            args=["-m", "src.mcp_server"],
+            cwd=os.getcwd(),
+            env=os.environ.copy(),
+            encoding="utf-8",
+        ),
+        name="SecureFinanceMonitor",
+        client_session_timeout_seconds=60.0,  # Allow 60s for large email batches
+    )
 
-        if "error" in email_data:
-            display.mcp_status(success=False, email_count=0, error=email_data["error"])
-            display.error("Gmail fetch failed", email_data["error"])
+    try:
+        # STAGE 2-4: Call MCP tool (runs full security pipeline in MCP server)
+        # This executes: Gmail API → Blocklist → PII Redaction → Transaction Extraction
+        async with mcp_client:
+            logger.info("📡 Calling MCP tool: fetch_financial_emails")
+            result = await mcp_client.call_tool(
+                "fetch_financial_emails",
+                {"days": args.days, "max_results": args.max_results}
+            )
+
+        # Parse MCP tool response (extract content from CallToolResult)
+        try:
+            # Extract content from CallToolResult object
+            result_content = result.content if hasattr(result, 'content') else str(result)
+
+            # Debug: log what we got
+            logger.debug(f"Result type: {type(result)}, Content type: {type(result_content)}")
+            logger.debug(f"Content preview: {str(result_content)[:200]}")
+
+            # If content is a list, get the first item (which should be the text content)
+            if isinstance(result_content, list) and len(result_content) > 0:
+                # MCP returns content as list of content blocks, get text from first block
+                first_item = result_content[0]
+                if hasattr(first_item, 'text'):
+                    result_text = first_item.text
+                elif isinstance(first_item, dict) and 'text' in first_item:
+                    result_text = first_item['text']
+                else:
+                    result_text = str(first_item)
+            else:
+                result_text = result_content if isinstance(result_content, str) else str(result_content)
+
+            scan_data = json.loads(result_text)
+        except json.JSONDecodeError as e:
+            display.error("MCP tool response parse error", str(e))
             sys.exit(1)
 
-        emails = email_data.get("emails", [])
-        display.mcp_status(success=True, email_count=len(emails))
+        if "error" in scan_data:
+            display.mcp_status(success=False, email_count=0, error=scan_data["error"])
+            display.error("MCP tool failed", scan_data["error"])
+            sys.exit(1)
+
+        # Extract pipeline stats and data from MCP response
+        pipeline_stats = scan_data.get("pipeline_stats", {})
+        transactions = scan_data.get("transactions", [])
+        redaction_stats = scan_data.get("redaction_stats", {})
+        pii_example = scan_data.get("pii_example")
+
+        # STAGE 2: Display MCP status (Gmail fetch)
+        fetched_count = pipeline_stats.get("fetched", 0)
+        display.mcp_status(success=True, email_count=fetched_count)
         time.sleep(0.3)  # Progressive output for demo
 
-        # STAGE 3: Blocklist - Pre-filtering
-        blocklist = get_blocklist()
-        emails_after_blocklist = []
-        blocked_count = 0
-
-        for email in emails:
-            sender = email.get("sender", "")
-            subject = email.get("subject", "")
-            is_blocked, reason = blocklist.is_blocked(sender, subject)
-
-            if is_blocked:
-                blocked_count += 1
-                logger.debug(f"Blocked email by {reason}: {subject[:50]}")
-            else:
-                emails_after_blocklist.append(email)
-
-        emails = emails_after_blocklist
-        blocklist_stats = blocklist.stats()
-        display.blocklist_status(blocklist_stats)
+        # STAGE 3: Display Blocklist status
+        blocked_count = pipeline_stats.get("blocked", 0)
+        blocklist = get_blocklist()  # Just for stats display
+        display.blocklist_status(blocklist.stats())
         time.sleep(0.3)  # Progressive output for demo
 
-        # STAGE 4: Redaction - PII sanitization
-        redaction_stats = email_data.get("redaction_stats", {})
+        # STAGE 4: Display Redaction status
         display.redaction_status(
-            total_redactions=redaction_stats.get("total_redactions", 0),
+            total_redactions=pipeline_stats.get("redacted", 0),
             by_type=redaction_stats.get("by_type", {}),
-            failed=redaction_stats.get("failed_emails", 0)
+            failed=pipeline_stats.get("failed_closed", 0)
         )
         time.sleep(0.3)  # Progressive output for demo
 
         # STAGE 4.5: THE MONEY SHOT - Before/After PII example
-        pii_example = email_data.get("pii_example")
         if pii_example and pii_example.get("before"):
             display.pii_before_after(
                 before=pii_example["before"],
@@ -212,54 +250,23 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> None:
                 redaction_count=pii_example.get("redaction_count", 0)
             )
 
-        # STAGE 5: Agent - Extract and analyze transactions
-        from .agent.extractor import extract_transaction
-        from .agent.tools import check_prompt_injection_raw
-        from .agent.finance_agent import _quick_categorize
-
-        transactions = []
-        injections_detected = 0
-
-        for email in emails:
-            redacted_body = email.get("redacted_body", "")
-
-            # Check for prompt injection
-            injection_result = check_prompt_injection_raw(redacted_body)
-            if injection_result["is_suspicious"]:
-                injections_detected += 1
-                audit.log_security_event(
-                    "PROMPT_INJECTION",
-                    f"Email {email.get('id', '')}: {injection_result['patterns_found']}"
-                )
-                audit_events_count += 1
-
-            # Extract transaction
-            email_for_extraction = {
-                "id": email.get("id", ""),
-                "sender": email.get("sender", ""),
-                "subject": email.get("subject", ""),
-                "date": email.get("date", ""),
-                "body": redacted_body,
-            }
-
-            extracted = extract_transaction(email_for_extraction)
-            if extracted:
-                txn = {
-                    "source_email_id": extracted.get("email_id", ""),
-                    "merchant": extracted.get("merchant", "Unknown"),
-                    "subject": email.get("subject", ""),
-                    "date": extracted.get("date", email.get("date", "")),
-                    "amount": extracted.get("amount", 0.0),
-                    "category": _quick_categorize(extracted.get("merchant", ""), email.get("subject", "")),
-                    "payment_method_type": extracted.get("payment_method_type"),
-                }
-                transactions.append(txn)
+        # STAGE 5: Display Agent status (extraction already done in MCP server)
+        # The MCP server already: extracted transactions, detected injections, categorized
+        injections_detected = pipeline_stats.get("injections", 0)
 
         display.agent_status(
             transactions_extracted=len(transactions),
             injections_detected=injections_detected
         )
         time.sleep(0.3)  # Progressive output for demo
+
+        # Log injection events if any detected
+        if injections_detected > 0:
+            audit.log_security_event(
+                "PROMPT_INJECTION",
+                f"{injections_detected} prompt injection(s) detected by MCP server"
+            )
+            audit_events_count += 1
 
         # STAGE 6: Storage - Save to encrypted database
         saved_count = 0
@@ -334,6 +341,12 @@ def cmd_scan(args: argparse.Namespace, config: Config) -> None:
         audit.log_security_event("SCAN_ERROR", str(e))
         display.error("Scan failed", str(e))
         handle_error("Scan failed", e)
+
+
+def cmd_scan(args: argparse.Namespace, config: Config) -> None:
+    """Sync wrapper for async_cmd_scan."""
+    import asyncio
+    asyncio.run(async_cmd_scan(args, config))
 
 
 def cmd_demo(args: argparse.Namespace, config: Config) -> None:
@@ -576,8 +589,8 @@ def cmd_demo_injection(args: argparse.Namespace, config: Config) -> None:
     db.close()
 
 
-def cmd_chat(args: argparse.Namespace, config: Config) -> None:
-    """Interactive chat mode with the agent and visible security pipeline."""
+async def async_cmd_chat(args: argparse.Namespace, config: Config) -> None:
+    """Interactive chat mode with the agent via MCP (ASYNC)."""
     db, audit, agent = init_components(config)
 
     # Task 5: Initialize PipelineDisplay for chat mode
@@ -601,17 +614,13 @@ def cmd_chat(args: argparse.Namespace, config: Config) -> None:
             if not user_input.strip():
                 continue
 
-            # Chat with agent
+            # Chat with agent (ASYNC)
             try:
-                # Get response from agent
-                response, metadata = agent.chat(user_input, return_metadata=True)
+                # Get response from agent (now async, returns metadata directly)
+                response, metadata = await agent.chat(user_input, return_metadata=True)
 
-                # Get pipeline stats from tools module (more reliable than SDK metadata)
-                from .agent.tools import get_last_pipeline_stats
-                pipeline_stats = get_last_pipeline_stats()
-
-                # Merge with audit count
-                pipeline_stats["audited"] = 1  # At least one audit event per chat
+                # metadata includes pipeline_stats from MCP tool response
+                pipeline_stats = metadata
 
                 # Task 5: Display compact pipeline status + response
                 display.chat_response(pipeline_stats, response)
@@ -624,12 +633,19 @@ def cmd_chat(args: argparse.Namespace, config: Config) -> None:
 
             except Exception as e:
                 error_console.print(f"[red]Error processing message: {e}[/red]")
+                logger.error("Chat error: %s", e, exc_info=True)
                 audit.log_security_event("CHAT_ERROR", str(e))
 
     except KeyboardInterrupt:
         console.print("\n[dim]Interrupted. Goodbye![/dim]")
     finally:
         db.close()
+
+
+def cmd_chat(args: argparse.Namespace, config: Config) -> None:
+    """Sync wrapper for async_cmd_chat."""
+    import asyncio
+    asyncio.run(async_cmd_chat(args, config))
 
 
 def cmd_summary(args: argparse.Namespace, config: Config) -> None:

@@ -18,6 +18,19 @@
 
 **Known Limitations:** See [docs/WHAT_COULD_BREAK.md](docs/WHAT_COULD_BREAK.md) for failure modes and production gaps.
 
+### Recent Updates (February 2026)
+
+**MCP Architecture Refactor** ✅ COMPLETE
+- **Issue**: Agent was bypassing MCP protocol by directly importing Python functions from MCP server
+- **Fix**: Full MCP client-server architecture with stdio transport
+  - Agent connects via `MCPServerStdio` with 60-second timeout for large email batches
+  - MCP server runs full security pipeline (blocklist → PII redaction → extraction)
+  - Returns ONLY sanitized transaction data as JSON
+  - Scan mode calls MCP tools directly via `mcp_client.call_tool()`
+  - Chat mode extracts pipeline stats from `run_result.new_items`
+- **Result**: Proper protocol separation, pipeline stats display correctly in chat mode
+- **Files Modified**: [src/main.py](src/main.py), [src/agent/finance_agent.py](src/agent/finance_agent.py), [src/mcp_server/\_\_main\_\_.py](src/mcp_server/__main__.py), [src/mcp_server/server.py](src/mcp_server/server.py)
+
 ---
 
 ## Project Overview

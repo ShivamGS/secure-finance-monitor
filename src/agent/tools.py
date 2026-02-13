@@ -1,8 +1,12 @@
 """
-Agent tools for the finance monitoring agent.
+Agent LOCAL tools (non-MCP).
 
-These tools wrap MCP server calls and add agent-level logic.
-They are registered with the OpenAI Agents SDK as function_tools.
+MCP tools (fetch_financial_emails, get_email_detail) are auto-discovered by the agent
+via MCPServerStdio. These are LOCAL tools that don't require MCP:
+  - categorize_transaction: Pure logic, no Gmail
+  - detect_anomalies: Pure analysis, no Gmail
+  - generate_summary: Local aggregation
+  - check_prompt_injection: Local security check
 """
 
 import json
@@ -30,105 +34,8 @@ _INJECTION_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("base64_block", re.compile(r"[A-Za-z0-9+/]{40,}={0,2}", re.IGNORECASE)),
 ]
 
-# Module-level pipeline statistics for chat mode display
-_last_pipeline_stats = {
-    "fetched": 0,
-    "blocked": 0,
-    "redacted": 0,
-    "injections": 0,
-    "stored": 0
-}
-
-
-def get_last_pipeline_stats() -> dict:
-    """Get the most recent pipeline statistics from tool execution."""
-    return dict(_last_pipeline_stats)
-
-
-@function_tool
-def scan_financial_emails(days: int = 30, max_results: int = 100) -> str:
-    """
-    Scan Gmail for recent financial emails. Returns extracted transaction data.
-
-    Args:
-        days: Number of days to look back (default 30)
-        max_results: Maximum number of emails to return (default 100, max 100)
-    """
-    from ..mcp_server.server import fetch_financial_emails
-    from .extractor import extract_transaction
-    from ..config.blocklist import get_blocklist
-
-    # Limit max_results to 100 to match scan command default
-    max_results = min(max_results, 100)
-
-    logger.info(f"📧 Scanning Gmail: last {days} days, max {max_results} emails")
-    result = fetch_financial_emails(days=days, max_results=max_results)
-    emails = result.get('emails', [])
-    total_redactions = result.get('total_redactions', 0)  # Preserve from MCP server
-    logger.info(f"📬 Found {len(emails)} emails")
-
-    # Apply blocklist pre-filtering (Task 7: Cequence demo)
-    blocklist = get_blocklist()
-    emails_after_blocklist = []
-    blocked_count = 0
-
-    for email in emails:
-        sender = email.get("sender", "")
-        subject = email.get("subject", "")
-        is_blocked, reason = blocklist.is_blocked(sender, subject)
-
-        if is_blocked:
-            blocked_count += 1
-            logger.debug(f"Blocked email by {reason}: {subject[:50]}")
-        else:
-            emails_after_blocklist.append(email)
-
-    logger.info(f"🚫 Blocklist filtered out {blocked_count}/{len(emails)} emails")
-    emails = emails_after_blocklist
-
-    # Extract transaction data from each email using smart extractor
-    transactions = []
-    skipped = 0
-
-    for email in emails:
-        try:
-            # Map redacted_body to body for extractor compatibility
-            email_for_extraction = {
-                "id": email.get("id", ""),
-                "sender": email.get("sender", ""),
-                "subject": email.get("subject", ""),
-                "date": email.get("date", ""),
-                "body": email.get("redacted_body", ""),  # Map redacted_body -> body
-            }
-
-            transaction = extract_transaction(email_for_extraction)
-            if transaction:
-                transactions.append(transaction)
-            else:
-                skipped += 1
-                logger.debug(f"Skipped email {email.get('id')} - not a financial transaction")
-        except Exception as e:
-            logger.warning(f"Failed to extract from email {email.get('id')}: {e}")
-            skipped += 1
-
-    logger.info(f"✅ Extracted {len(transactions)} transactions, skipped {skipped} non-financial emails")
-
-    # Update module-level stats for chat mode display
-    _last_pipeline_stats["fetched"] = len(emails)
-    _last_pipeline_stats["blocked"] = blocked_count
-    _last_pipeline_stats["redacted"] = total_redactions
-    _last_pipeline_stats["injections"] = 0  # Updated by check_prompt_injection if called
-    _last_pipeline_stats["stored"] = len(transactions)
-
-    return json.dumps({
-        'total_emails': len(emails),
-        'blocked_count': blocked_count,
-        'transactions_found': len(transactions),
-        'total_redactions': total_redactions,  # Pass through from MCP server
-        'skipped': skipped,
-        'transactions': transactions,
-        'summary': f'Extracted {len(transactions)} transactions from {len(emails)} emails ({blocked_count} blocked, {skipped} skipped)'
-    }, default=str)
+# NOTE: scan_financial_emails is now an MCP tool (auto-discovered by agent)
+# It runs in the MCP server with the full security pipeline (blocklist → PII → extraction)
 
 
 @function_tool

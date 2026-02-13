@@ -10,29 +10,34 @@ Security-first AI agent for monitoring personal finances via Gmail with zero PII
                         SECURE PERSONAL FINANCE MONITOR
  ┌─────────────────────────────────────────────────────────────────────────────┐
  │                                                                             │
- │  ┌───────────────┐    ┌───────────────┐    ┌─────────────────────────────┐ │
- │  │  GMAIL API    │    │  BLOCKLIST    │    │   PII REDACTION WALL        │ │
- │  │  (MCP Server) │───>│   (Layer 2)   │───>│   (Layer 3)                 │ │
- │  │               │    │               │    │                             │ │
- │  │  - Read-only  │    │  - Spam       │    │  Pass 1: Regex (10 patterns)│ │
- │  │  - OAuth2     │    │  - Promo      │    │  Pass 2: Presidio NER       │ │
- │  │  - Financial  │    │  - Marketing  │    │  Pass 3: Validator sweep    │ │
- │  │    senders    │    │  - Sender     │    │                             │ │
- │  │               │    │    filter     │    │  FAIL CLOSED:               │ │
- │  └───────────────┘    │               │    │  Error = no content         │ │
- │                       └───────────────┘    │  passes through             │ │
- │                                            └─────────────┬───────────────┘ │
- │                                                          │                 │
- │                                                          v                 │
+ │  ┌────────────────────────────────────────────────────────────────────┐    │
+ │  │                    MCP SERVER (Layer 1)                             │    │
+ │  │                    Security Boundary - Nothing Raw Escapes          │    │
+ │  │                                                                      │    │
+ │  │  ┌──────────┐  ┌───────────┐  ┌──────────────┐  ┌──────────────┐  │    │
+ │  │  │  GMAIL   │─>│ BLOCKLIST │─>│ PII REDACTOR │─>│ TRANSACTION  │  │    │
+ │  │  │   API    │  │ (Layer 2) │  │  (Layer 3)   │  │  EXTRACTOR   │  │    │
+ │  │  │          │  │           │  │              │  │              │  │    │
+ │  │  │Read-only │  │- Spam     │  │3-pass:       │  │Regex-based   │  │    │
+ │  │  │OAuth2    │  │- Promo    │  │1. Regex      │  │parsing       │  │    │
+ │  │  │Financial │  │- Marketing│  │2. Presidio   │  │              │  │    │
+ │  │  │senders   │  │- Sender   │  │3. Validator  │  │              │  │    │
+ │  │  │          │  │  filter   │  │FAIL CLOSED   │  │              │  │    │
+ │  │  └──────────┘  └───────────┘  └──────────────┘  └──────┬───────┘  │    │
+ │  │                                                         │          │    │
+ │  └─────────────────────────────────────────────────────────┼──────────┘    │
+ │                                                            │               │
+ │                                    Sanitized JSON only     │               │
+ │                                    (no PII, no raw emails) │               │
+ │                                                            v               │
  │                                            ┌──────────────────────────────┐ │
  │                                            │  AI AGENT (Layer 4)          │ │
  │                                            │  (OpenAI Agents SDK)         │ │
  │                                            │                              │ │
- │                                            │  - Transaction extraction    │ │
  │                                            │  - Categorization            │ │
  │                                            │  - Anomaly detection         │ │
  │                                            │  - Injection detection       │ │
- │                                            │  - Output sanitized          │ │
+ │                                            │  - Output sanitization       │ │
  │                                            └──────────────┬───────────────┘ │
  │                                                           │                 │
  │  ┌────────────────────────────────────────────────────────┘                 │
@@ -52,13 +57,13 @@ Security-first AI agent for monitoring personal finances via Gmail with zero PII
  └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Data Flow:** Gmail API → Blocklist → PII Redactor (3-pass, no LLM) → Sanitized Data → AI Agent → Encrypted DB + Audit Log
+**Data Flow:** Gmail API → Blocklist → PII Redactor → Transaction Extractor *(all within MCP server)* → Sanitized JSON → AI Agent → Encrypted DB + Audit Log
 
 ## Security Pipeline
 
 | Layer | Component | Function | Failure Mode |
 |-------|-----------|----------|--------------|
-| 1 | **MCP Gateway** | Gmail API with `gmail.readonly` scope, OAuth 2.0 | No write access to email; token.json theft exposes read-only access |
+| 1 | **MCP Server** | Gmail API (OAuth 2.0, `gmail.readonly`) + Blocklist + PII Redaction (3-pass) + Transaction Extraction | Token.json theft exposes read-only access; extraction may miss transactions |
 | 2 | **Email Blocklist** | Pre-filter spam/promotional emails by sender/domain/subject | Misconfiguration may block legitimate transactions; no security impact |
 | 3 | **PII Redaction** | 3-pass pipeline: Regex (10 patterns) → Presidio NER → Validator | **FAIL CLOSED** — errors withhold content; some PII patterns may be missed |
 | 4 | **Agent Security** | Prompt injection detection (10 patterns), hardened prompts, output re-scanning | Injection may bypass detection; redaction wall bounds damage |
@@ -81,6 +86,50 @@ Security-first AI agent for monitoring personal finances via Gmail with zero PII
 | Physical Address | `123 Main St, San Francisco CA 94102` | `[ADDRESS_REDACTED]` | 55 |
 
 **Note:** Dollar amounts (`$123.45`), merchant names, dates, and redaction tags are intentionally preserved — the agent needs them for analysis.
+
+## MCP (Model Context Protocol) Architecture
+
+The system uses proper MCP client-server architecture for secure Gmail integration:
+
+```
+Agent (MCP Client)              MCP Server (stdio)              Gmail API
+     │                                │                              │
+     │  MCPServerStdio                │  FastMCP                     │
+     │  - 60s timeout                 │  - Blocklist filter          │
+     │  - Auto-discover tools         │  - PII redaction (3-pass)    │
+     │                                │  - Transaction extraction    │
+     │                                │                              │
+     ├──────call_tool()──────────────>│────────read emails──────────>│
+     │   fetch_financial_emails       │                              │
+     │   {days: 30, max_results: 100} │                              │
+     │                                │<─────raw email data──────────┤
+     │                                │                              │
+     │                                │  [SECURITY PIPELINE]         │
+     │                                │  1. Apply blocklist          │
+     │                                │  2. Redact PII               │
+     │                                │  3. Extract transactions     │
+     │                                │                              │
+     │<────JSON response───────────────┤                              │
+     │  {transactions: [...],         │                              │
+     │   pipeline_stats: {            │                              │
+     │     fetched: 100,              │                              │
+     │     blocked: 20,               │                              │
+     │     redacted: 265              │                              │
+     │   }}                           │                              │
+```
+
+**Key Features:**
+- **Stdio Transport**: MCP server runs as subprocess, communicates via stdin/stdout
+- **Security Boundary**: Full pipeline (blocklist → redaction → extraction) runs in MCP server
+- **Agent Never Sees Raw Data**: Returns only sanitized transaction metadata
+- **60-Second Timeout**: Configured for large email batch processing
+- **Pipeline Stats**: Real-time visibility into security layers (fetched, blocked, redacted counts)
+
+**Running MCP Server Standalone:**
+```bash
+# Start MCP server (for debugging)
+python -m src.mcp_server
+```
 
 ## Quick Start
 
@@ -188,13 +237,13 @@ secure-finance-monitor/
 
 ## How Components Connect
 
-**Scan Flow:**
-`main.py:cmd_scan` → `mcp_server/server.py:fetch_financial_emails` → `config/blocklist.py:Blocklist.is_blocked` → `redactor/pii_redactor.py:PIIRedactor.redact` → `agent/extractor.py:extract_transaction` → `storage/database.py:save_transactions` → `storage/audit.py:log_email_processed`
+**Scan Flow (Direct MCP):**
+`main.py:cmd_scan` → MCP client → `mcp_server/server.py:fetch_financial_emails` → `blocklist.py:is_blocked` → `pii_redactor.py:redact` → `extractor.py:extract_transaction` → returns sanitized JSON → `storage/database.py:save_transactions` → `storage/audit.py:log_email_processed`
 
-**Chat Flow:**
-`main.py:cmd_chat` → `agent/finance_agent.py:FinanceAgent.chat` → `agent/tools.py:scan_financial_emails` → (same pipeline as scan) → `agent/finance_agent.py:sanitize_response` → `storage/audit.py:log_response_sent`
+**Chat Flow (Agent + MCP):**
+`main.py:cmd_chat` → `finance_agent.py:FinanceAgent.chat` → Agent calls MCP tool → `mcp_server/server.py:fetch_financial_emails` OR `get_financial_summary` → (same security pipeline) → Agent receives sanitized JSON → `finance_agent.py:sanitize_response` → `storage/audit.py:log_response_sent`
 
-**Both paths use identical fetch → blocklist → redact → extract pipeline.**
+**Both paths use identical MCP security pipeline: Gmail API → Blocklist → PII Redaction → Transaction Extraction**
 
 ## Environment Variables
 
