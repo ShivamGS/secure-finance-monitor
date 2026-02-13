@@ -291,8 +291,6 @@ See `.env.example` for complete list.
 | [Sample Outputs](docs/sample_outputs/) | Example command outputs from real Gmail inbox |
 | [WHAT_COULD_BREAK.md](docs/WHAT_COULD_BREAK.md) | Failure mode analysis, attack scenarios, production gaps |
 | [CLI_COMMANDS.md](CLI_COMMANDS.md) | Complete command reference with all flags |
-| [IMPROVEMENTS_SUMMARY.md](IMPROVEMENTS_SUMMARY.md) | Email filtering and accuracy improvements |
-| [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) | Development context for resuming work |
 
 ## Tech Stack
 

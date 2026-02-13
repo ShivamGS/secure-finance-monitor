@@ -69,9 +69,50 @@ text = unicodedata.normalize('NFKC', text)  # Convert fullwidth → ASCII
 
 ---
 
+## 🟢 Data Management Issues
+
+### 5. SQLCipher Silent Fallback
+**Problem:** Falls back to plaintext SQLite if SQLCipher unavailable (no warning)  
+**Impact:** **MEDIUM** - Database stored unencrypted on disk  
+**Solution:** Fail loudly when encryption expected but unavailable:
+```python
+if DB_ENCRYPTION_KEY and not has_sqlcipher:
+    raise RuntimeError("Encryption key set but SQLCipher unavailable")
+```
+**Effort:** LOW | **Priority:** MEDIUM
+
+---
+
+### 6. No Encryption Key Rotation
+**Problem:** Encryption key never rotates - operational risk over time  
+**Impact:** **LOW** - Stale keys increase risk if compromised; old data undecryptable after rotation  
+**Solution:** Implement re-encryption workflow:
+```python
+# 1. Decrypt with old key
+# 2. Re-encrypt with new key  
+# 3. Update key reference in .env
+```
+**Effort:** MEDIUM | **Priority:** LOW
+
+---
+
+### 7. Audit Chain Last-Entry Tampering
+**Problem:** Backward-looking hashes - last entry can be modified undetected  
+**Attack:** Modify most recent audit entry, recompute hash, chain validates  
+**Impact:** **LOW** - Audit integrity compromised but no PII leak  
+**Solution:** External anchor for tamper evidence:
+```python
+# Publish root hash to blockchain/timestamp service
+# Or implement forward references (next entry signs previous)
+```
+**Effort:** MEDIUM | **Priority:** LOW
+
+---
+
+
 ## 🟡 Operational Limitations
 
-### 5. MCP Tool Parameter Abuse
+### 8. MCP Tool Parameter Abuse
 **Problem:** `days` parameter not capped - could request decades of emails  
 **Scenario:** Malicious prompt → agent calls `fetch_financial_emails(days=36500)`  
 **Impact:** **MEDIUM** - Gmail quota exhaustion, timeout, service DoS (no PII leak)  
@@ -85,7 +126,7 @@ if days > 365:
 
 ---
 
-### 6. MCP Server Code Modification
+### 9. MCP Server Code Modification
 **Problem:** No verification that server code hasn't been tampered with  
 **Scenario:** Attacker with file access modifies `src/mcp_server/server.py`  
 **Impact:** **CRITICAL** (if file access compromised) - Entire security boundary collapses  
@@ -99,7 +140,7 @@ if days > 365:
 
 ---
 
-### 7. No Gmail API Rate Limiting
+### 10. No Gmail API Rate Limiting
 **Problem:** Burst scans may hit Gmail quotas (25,000 requests/day, 250/second)  
 **Impact:** **LOW** - Operation fails, availability issue only (no security breach)  
 **Solution:** Add exponential backoff:
@@ -114,45 +155,6 @@ def fetch_emails():
 
 ---
 
-## 🟢 Data Management Issues
-
-### 8. SQLCipher Silent Fallback
-**Problem:** Falls back to plaintext SQLite if SQLCipher unavailable (no warning)  
-**Impact:** **MEDIUM** - Database stored unencrypted on disk  
-**Solution:** Fail loudly when encryption expected but unavailable:
-```python
-if DB_ENCRYPTION_KEY and not has_sqlcipher:
-    raise RuntimeError("Encryption key set but SQLCipher unavailable")
-```
-**Effort:** LOW | **Priority:** MEDIUM
-
----
-
-### 9. No Encryption Key Rotation
-**Problem:** Encryption key never rotates - operational risk over time  
-**Impact:** **LOW** - Stale keys increase risk if compromised; old data undecryptable after rotation  
-**Solution:** Implement re-encryption workflow:
-```python
-# 1. Decrypt with old key
-# 2. Re-encrypt with new key  
-# 3. Update key reference in .env
-```
-**Effort:** MEDIUM | **Priority:** LOW
-
----
-
-### 10. Audit Chain Last-Entry Tampering
-**Problem:** Backward-looking hashes - last entry can be modified undetected  
-**Attack:** Modify most recent audit entry, recompute hash, chain validates  
-**Impact:** **LOW** - Audit integrity compromised but no PII leak  
-**Solution:** External anchor for tamper evidence:
-```python
-# Publish root hash to blockchain/timestamp service
-# Or implement forward references (next entry signs previous)
-```
-**Effort:** MEDIUM | **Priority:** LOW
-
----
 
 ## 🛡️ Defense-in-Depth: What Protects You
 
@@ -171,20 +173,5 @@ Even when individual layers fail, multiple protections remain:
 As long as this succeeds, most attacks are bounded to low/medium impact.
 
 ---
-
-## 🎯 Quick Reference: Risk Assessment
-
-| Issue | Likelihood | Impact | Fix Effort | Priority |
-|-------|-----------|--------|-----------|----------|
-| Unicode PII bypass | MEDIUM | **CRITICAL** | MEDIUM | **HIGH** ✅ |
-| Token theft | LOW | **HIGH** | MEDIUM | **HIGH** ✅ |
-| International PII | MEDIUM | **HIGH** | MEDIUM | HIGH* |
-| Prompt injection | MEDIUM | Low† | HIGH | MEDIUM |
-| Parameter abuse | LOW | Medium | LOW | MEDIUM |
-| Code modification | LOW‡ | Critical‡ | MEDIUM | MEDIUM |
-| SQLCipher fallback | LOW | Medium | LOW | **MEDIUM** ✅ |
-| No rate limiting | LOW | Low | LOW | LOW |
-| Key rotation | LOW | Low | MEDIUM | LOW |
-| Audit tampering | LOW | Low | MEDIUM | LOW |
 
 
